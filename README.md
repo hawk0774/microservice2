@@ -245,3 +245,973 @@
 ✅ **Экономичность** при использовании самостоятельной инфраструктуры  
 
 Это решение подходит как для стартапов, так и для крупных корпоративных организаций и соответствует всем указанным в задаче требованиям.
+
+
+## Задача 2: Логирование
+
+**Стек технологий: Grafana Loki + Promtail + Grafana**
+
+| Компонент | Установка | Где работает |
+|-----------|-----------|---|
+| **Promtail** | Systemd сервис | На каждом сервере с приложением |
+| **Loki** | Systemd сервис | На отдельном центральном сервере |
+| **Grafana** | Systemd сервис | На отдельном центральном сервере |
+
+
+### Требование 1: Сбор логов в центральное хранилище со всех хостов
+
+**Решение:** Promtail как systemd сервис
+
+На каждом хосте с приложением устанавливается Promtail:
+
+**Как работает:**
+
+1. **Установка Promtail на хост**
+   - Скачивается binary файл
+   - Распаковывается в `/opt/promtail/`
+   - Создаётся конфигурационный файл `/etc/promtail/config.yml`
+   - Создаётся systemd сервис `/etc/systemd/system/promtail.service`
+
+2. **Запуск Promtail**
+   ```
+   systemctl enable promtail
+   systemctl start promtail
+   ```
+
+3. **Что Promtail делает**
+   - Постоянно работает в фоне
+   - Читает логи из файлов или журналов системы
+   - Добавляет метаданные (labels): hostname, app, environment, version
+   - Буферизирует логи при потере соединения
+   - Отправляет в Loki по HTTP
+
+4. **Масштабирование**
+   - При добавлении нового хоста просто установить Promtail на него
+   - Или использовать Ansible playbook для автоматизации
+   - На 100 хостов это займёт 1-2 часа с Ansible
+
+**Преимущества подхода:**
+
+- Не требует изменений в приложениях
+- Работает с любыми языками программирования
+- Собирает логи всех процессов на хосте
+- Автоматически обнаруживает ротацию логов
+
+---
+
+### Требование 2: Минимальные требования к приложениям, сбор логов из stdout
+
+**Решение:** Promtail читает логи из стандартного потока
+
+Приложению не нужно ничего менять. Оно просто пишет в stdout как обычно:
+
+**Как это работает:**
+
+1. **Приложение пишет лог**
+   ```
+   Приложение выполняет: console.log("Error occurred")
+   или: logger.error("Database connection failed")
+   или: echo "Server started" 
+   ```
+
+2. **Перенаправление логов**
+   - Если приложение запущено через systemd сервис:
+     - Используется StandardOutput=journal (системный журнал)
+     - Или StandardOutput=append:/var/log/app.log
+   
+   - Если приложение запущено напрямую:
+     - Перенаправляем: `app > /var/log/app.log 2>&1`
+
+3. **Promtail читает логи**
+   - Следит за файлом `/var/log/app.log` (как `tail -f`)
+   - При новых строках читает их
+   - Отправляет в Loki
+   - Обрабатывает ротацию файлов автоматически
+
+**Способы сбора логов:**
+
+**Способ 1: Из файла логов**
+```
+Приложение → /var/log/app.log
+                ↓
+            Promtail читает
+                ↓
+            Отправляет в Loki
+```
+
+**Способ 2: Из systemd журнала**
+```
+Приложение → systemd (journald)
+                ↓
+            Promtail читает через journald
+                ↓
+            Отправляет в Loki
+```
+
+**Способ 3: Из нескольких файлов**
+```
+Приложение 1 → /var/log/app1.log
+Приложение 2 → /var/log/app2.log
+Приложение 3 → /var/log/app3.log
+                ↓
+            Promtail читает все файлы
+                ↓
+            Отправляет в Loki
+```
+
+**Преимущества:**
+
+- Не нужны изменения в коде приложения
+- Работает с legacy приложениями
+- Работает с приложениями на любом языке
+- Минимум настройки
+
+---
+
+### Требование 3: Гарантированная доставка логов до центрального хранилища
+
+**Решение:** Буферизация и механизм повтора в Promtail
+
+Promtail гарантирует, что ни один лог не будет потерян, даже если Loki временно недоступна.
+
+**Механизм 1: Write Ahead Log (WAL)**
+
+Promtail может сохранять логи локально перед отправкой:
+- Каждый лог сначала сохраняется на диск хоста в `/var/lib/promtail/wal/`
+- Потом отправляется в Loki
+- Только когда Loki подтвердит получение, лог удаляется с диска
+
+**Механизм 2: Буферизация в памяти**
+
+- Promtail буферизирует логи в памяти (обычно 10-100 MB)
+- Если сеть упала, буфер растёт
+- Когда соединение восстановилось, отправляет весь буфер в Loki
+
+**Механизм 3: Retry-логика**
+
+- Если отправка лога не удалась (timeout, ошибка 500), Promtail повторит
+- Максимальное количество попыток: настраивается (обычно 5-10)
+- Интервал между попытками растёт (backoff strategy)
+- Через N часов прекращает попытки и логирует ошибку
+
+**Практический сценарий:**
+
+```
+День 1, 14:00 - Loki сервер упал
+  → Promtail на всех хостах обнаруживает сбой
+  → Логи сохраняются в WAL на диск каждого хоста
+  → Promtail продолжает собирать новые логи
+
+День 1, 14:30 - Loki восстановлена
+  → Promtail обнаруживает восстановление
+  → Отправляет все сохранённые логи (14:00-14:30)
+  → Продолжает отправлять новые логи в реальном времени
+
+Результат: ни один лог не потерян!
+```
+
+**Мониторинг Promtail:**
+
+Promtail сам экспортирует метрики о своей работе (для Prometheus):
+- `promtail_sent_entries_total` — всего отправлено логов
+- `promtail_dropped_entries_total` — потеряно логов (если буфер переполнен)
+- `promtail_batches_sent_total` — количество батчей
+- `promtail_forward_errors_total` — ошибки отправки
+
+Это позволяет видеть проблемы с доставкой через дашборд мониторинга.
+
+---
+
+### Требование 4: Обеспечение поиска и фильтрации по записям логов
+
+**Решение:** LogQL язык запросов
+
+Loki предоставляет LogQL — специальный язык для поиска и фильтрации логов.
+
+**Типы поисков по labels:**
+
+```logql
+# Все логи с хоста web-01
+{hostname="web-01"}
+
+# Все логи приложения payment-service
+{app="payment-service"}
+
+# Логи production окружения
+{environment="production"}
+
+# Логи web-серверов только
+{hostname=~"web-.*"}
+
+# Все кроме health check логов
+{app="api"} != "health_check"
+```
+
+**Фильтрация по содержимому:**
+
+```logql
+# Все ошибки
+{app="payment"} | "ERROR"
+
+# Все ошибки с timeout
+{app="payment"} | "ERROR" | "timeout"
+
+# Логи по точной фразе
+{app="api"} | "Connection refused"
+
+# Исключить фразу
+{app="api"} | "ERROR" !="expected"
+```
+
+**Фильтрация JSON логов:**
+
+Если приложение пишет логи в JSON формате:
+```json
+{"timestamp":"2025-12-19T14:30:00Z","level":"ERROR","message":"Payment failed","user_id":123,"trace_id":"abc123"}
+```
+
+То можно фильтровать по полям:
+```logql
+# JSON логи где level=ERROR
+{app="payment"} | json | level="ERROR"
+
+# JSON логи где user_id=123
+{app="payment"} | json | user_id="123"
+
+# JSON логи где status_code >= 500
+{app="api"} | json | status_code >= 500
+
+# JSON логи с определённым trace_id
+{app="payment"} | json | trace_id="abc123"
+```
+
+**Агрегирующие запросы:**
+
+```logql
+# Количество ошибок за минуту
+sum(count_over_time({level="ERROR"}[1m]))
+
+# Количество ошибок по сервисам
+sum by (app) (count_over_time({level="ERROR"}[5m]))
+
+# Уникальные user_id с ошибками
+count(count_over_time({level="ERROR"} | json | label_format user=user_id | user != "" [1m]) by (user))
+```
+
+**Поиск во времени:**
+
+```logql
+# Логи за последний час
+{app="api"} | level="ERROR" [1h]
+
+# Логи за последние сутки
+{app="api"} [24h]
+
+# Логи между определёнными временами
+{app="api"} | level="ERROR" [2025-12-19T12:00:00Z to 2025-12-19T14:00:00Z]
+```
+
+---
+
+### Требование 5: Пользовательский интерфейс с возможностью предоставления доступа разработчикам
+
+**Решение:** Grafana Explore + RBAC
+
+**Grafana Explore — интерфейс для поиска логов:**
+
+1. Разработчик открывает Grafana (URL: `https://grafana.company.local`)
+2. Логинится с пользователем (например, dev@company.com)
+3. Переходит на вкладку "Explore"
+4. Выбирает источник данных "Loki"
+5. Вводит LogQL запрос в строку поиска
+6. Видит результаты логов в таблице
+7. Может переключаться между графическим и текстовым режимом
+
+**Возможности интерфейса:**
+
+- Автодополнение LogQL (при вводе)
+- История предыдущих запросов
+- Быстрые фильтры по labels (хост, приложение, уровень)
+- Увеличение масштаба на конкретный период времени
+- Скачивание результатов в CSV/JSON
+- Переход между логами и метриками одной кнопкой
+
+**RBAC — управление доступом:**
+
+Администратор настраивает в Grafana кто видит какие логи:
+
+```
+DevTeam A → видит только логи:
+  - Хосты: payment-01, payment-02
+  - Приложения: payment-service
+
+DevTeam B → видит только логи:
+  - Хосты: api-01, api-02, api-03
+  - Приложения: api-service
+
+DevOps Team → видит все логи
+
+Manager → видит публичные дашборды без деталей
+```
+
+**Как это настраивается:**
+
+1. Администратор создаёт группы в Grafana:
+   - `dev-team-a`
+   - `dev-team-b`
+   - `devops-team`
+
+2. Для каждой группы настраивает разрешения:
+   - View (только просмотр)
+   - Edit (создание поисков и дашбордов)
+   - Admin (управление группой)
+
+3. Привязывает пользователей к группам через LDAP/OAuth
+
+4. Настраивает ограничения доступа к data source (Loki):
+   - Какие labels может видеть каждая группа
+
+Графана автоматически фильтрует результаты на основе разрешений.
+
+---
+
+### Требование 6: Возможность дать ссылку на сохранённый поиск по записям логов
+
+**Решение:** Сохранённые поиски в Grafana Explore
+
+**Как это работает:**
+
+1. **Разработчик создаёт поиск**
+   - Открывает Grafana Explore
+   - Выбирает Loki
+   - Вводит LogQL запрос: `{hostname="web-01"} | level="ERROR"`
+   - Нажимает "Search" и видит результаты
+
+2. **Сохранение поиска**
+   - Нажимает кнопку "Save"
+   - Даёт имя: "Web-01 Server Errors"
+   - Описание (опционально): "Все ошибки на основном web сервере"
+   - Нажимает "Save"
+
+3. **Система генерирует ссылку**
+   - Loki сохраняет этот поиск в базе данных Grafana
+   - Генерируется уникальный URL, например:
+     ```
+     https://grafana.company.local/explore?left={
+       "datasource":"loki",
+       "queries":[{
+         "expr":"{hostname=\"web-01\"}|level=\"ERROR\""
+       }]
+     }
+     ```
+
+4. **Распространение ссылки**
+   - Разработчик копирует ссылку
+   - Отправляет коллеге через Slack/Email
+   - Добавляет в документацию как: "Как смотреть ошибки web-01"
+
+5. **Коллега кликает ссылку**
+   - Открывается Grafana Explore
+   - Точно такой же запрос как создатель
+   - Видит логи с того же хоста/приложения
+   - Может добавить свои фильтры к уже сохранённому поиску
+
+**Преимущества сохранённых поисков:**
+
+- Не нужно каждый раз вводить сложный запрос
+- Можно создавать шаблоны для разных сценариев
+- Легко поделиться с командой
+- Документирует часто используемые поиски
+- История поисков для аналитики
+
+**Примеры сохранённых поисков:**
+
+```
+Организация: Payment Service Team
+├─ "Payment Errors (Last Hour)" — ошибки платежей за час
+├─ "Database Timeout Errors" — таймауты БД
+├─ "API 500 Errors" — все 500 ошибки API
+└─ "Slow Transactions (>5s)" — медленные транзакции
+
+Организация: DevOps Team
+├─ "System Errors All Servers" — системные ошибки везде
+├─ "Web Server Errors" — ошибки web серверов
+├─ "Database Replication Issues" — проблемы репликации БД
+└─ "High CPU Alerts" — высокая CPU
+```
+
+---
+
+## Обоснование выбора Loki
+
+### Почему Loki лучше, чем ELK Stack
+
+**ELK Stack (Elasticsearch + Logstash + Kibana):**
+
+Проблемы:
+- Elasticsearch индексирует **весь текст** каждого лога
+- На 100 хостов с 1 млн логов/день требуется 30-50 GB хранилища в сутки
+- Elasticsearch требует 32+ GB RAM для нормальной работы
+- Общая стоимость: $5,000-10,000/месяц в облаке
+- Требует 3 компонента для работы (сложнее администрировать)
+
+**Loki:**
+
+Преимущества:
+- Loki индексирует только **labels** (метаданные: app, hostname, level)
+- На 100 хостов требуется 100 GB хранилища в месяц
+- Loki требует только 4-8 GB RAM
+- Стоимость: $300-500/месяц в облаке
+- Работает как один сервис (проще администрировать)
+
+**Экономия: в 10-20 раз дешевле**
+
+### Почему Loki лучше, чем Splunk
+
+**Splunk:**
+- Очень мощный инструмент с продвинутой аналитикой
+- Стоимость: $1,000-10,000/месяц зависит от объёма
+- Требует лицензирования
+- Для типичной микросервисной архитектуры избыточен
+- Облачное решение (данные хранятся у Splunk)
+
+**Loki:**
+- Оптимален именно для микросервисных архитектур
+- Бесплатен (open source)
+- Полный контроль над данными
+- Можно развернуть on-premise или в облаке
+
+**Разница: Splunk для enterprise, Loki для всех**
+
+### Почему Loki лучше, чем Datadog
+
+**Datadog:**
+- All-in-one платформа (логи + метрики + APM)
+- Встроенная интеграция со всем
+- Стоимость: $50-200/месяц за хост (зависит от объёма данных)
+- Облачное решение (данные у Datadog)
+- Нет полного контроля
+
+**Loki:**
+- Специализирован на логах (focus)
+- Бесплатен
+- Полный контроль над данными
+- Можно комбинировать с другими инструментами
+
+**Разница: Datadog комфортен, Loki экономичен**
+
+---
+
+## Требования к ресурсам
+
+### На каждом хосте с приложением
+
+| Компонент | CPU | RAM | Диск |
+|-----------|-----|-----|------|
+| Promtail | 0.1 | 100 MB | 1 GB (буфер) |
+
+**Итого на 100 хостов:** ~10 CPU, 10 GB RAM, 100 GB диск (буферы)
+
+### На центральном сервере
+
+На 100 хостов с 1 млн логов на хост в день:
+
+| Компонент | CPU | RAM | Хранилище |
+|-----------|-----|-----|-----------|
+| Loki | 2-4 | 4-8 GB | 100 GB/месяц |
+| Grafana | 1 | 1 GB | 10 GB |
+| **ИТОГО** | **3-5** | **5-9 GB** | **110 GB/месяц** |
+
+**Self-hosted:** 1 сервер (4 CPU, 16 GB RAM, 500 GB SSD)
+
+
+## Заключение
+
+**Grafana Loki + Promtail + Grafana** — это оптимальное решение для логирования потому что:
+
+✅ **Полнота:** Соответствует всем 6 требованиям  
+✅ **Экономичность:** В 10-20 раз дешевле ELK  
+✅ **Простота:** Минимум требований к приложениям  
+✅ **Надёжность:** Гарантированная доставка логов  
+✅ **Масштабируемость:** От 1 до 1000+ серверов  
+✅ **Бесплатно:** Open source  
+✅ **Удобство:** Интеграция с Grafana и RBAC  
+
+Это позволяет разработчикам и DevOps быстро находить причины ошибок и фиксить баги в production среде.
+
+
+---
+
+## Задача 3: Мониторинг
+
+
+**Стек технологий: Prometheus + Node Exporter + Grafana + AlertManager**
+
+| Компонент | Установка | Где работает |
+|-----------|-----------|---|
+| **Node Exporter** | Systemd сервис | На каждом сервере |
+| **Prometheus** | Systemd сервис | На центральном сервере |
+| **AlertManager** | Systemd сервис | На центральном сервере |
+| **Grafana** | Systemd сервис | На центральном сервере |
+
+---
+
+## Анализ решения по требованиям задачи 3
+
+### Требование 1: Сбор метрик со всех хостов
+
+**Решение:** Node Exporter как systemd сервис + Pull-based модель
+
+**Как работает:**
+
+1. **Установка на каждый хост**
+   - Node Exporter binary копируется в `/opt/node_exporter/`
+   - Создаётся systemd сервис `/etc/systemd/system/node-exporter.service`
+   - Стартует: `systemctl enable node-exporter` и `systemctl start node-exporter`
+
+2. **Node Exporter экспортирует метрики**
+   - Слушает на localhost:9100
+   - Метрики доступны на: `http://localhost:9100/metrics`
+   - Можно проверить: `curl http://localhost:9100/metrics`
+
+3. **Prometheus скрейпит метрики**
+   - В конфиге Prometheus указываются хосты
+   - Каждые 15 секунд Prometheus делает HTTP запрос
+   - Получает метрики и сохраняет в TSDB
+
+### Требование 2: Метрики состояния ресурсов хостов: CPU, RAM, HDD, Network
+
+**Решение:** Node Exporter собирает стандартные системные метрики
+
+**CPU метрики:**
+
+```
+node_cpu_seconds_total{cpu="0",mode="user"}    # User mode
+node_cpu_seconds_total{cpu="0",mode="system"}  # System mode
+node_cpu_seconds_total{cpu="0",mode="idle"}    # Idle mode
+node_cpu_seconds_total{cpu="0",mode="iowait"}  # I/O wait
+
+node_load1   # Load average за 1 минуту
+node_load5   # Load average за 5 минут
+node_load15  # Load average за 15 минут
+```
+
+**Использование CPU в процентах можно вычислить:**
+
+```promql
+# CPU использование = 100% - idle%
+(1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100
+```
+
+**RAM метрики:**
+
+```
+node_memory_MemTotal_bytes           # Общее количество памяти
+node_memory_MemAvailable_bytes       # Доступная память
+node_memory_MemFree_bytes            # Свободная память (не используется)
+node_memory_MemUsed_bytes            # Используемая память
+node_memory_Buffers_bytes            # Буферы ОС
+node_memory_Cached_bytes             # Кэш страниц
+```
+
+**Использование RAM в процентах:**
+
+```promql
+# RAM используется = (Total - Available) / Total * 100
+(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+
+# Свобод RAM в процентах
+(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+```
+
+**Диск метрики:**
+
+```
+node_filesystem_size_bytes{mountpoint="/"}       # Размер раздела
+node_filesystem_avail_bytes{mountpoint="/"}      # Свободное место
+node_filesystem_used_bytes{mountpoint="/"}       # Занято
+
+node_disk_read_bytes_total{device="sda"}         # Всего прочитано с диска
+node_disk_write_bytes_total{device="sda"}        # Всего записано на диск
+node_disk_io_time_ms_total{device="sda"}         # Время выполнения I/O операций
+node_disk_reads_completed_total{device="sda"}    # Количество чтений
+node_disk_writes_completed_total{device="sda"}   # Количество записей
+```
+
+**Использование диска в процентах:**
+
+```promql
+# Диск используется (%)
+(1 - (node_filesystem_avail_bytes{mountpoint="/"} / 
+      node_filesystem_size_bytes{mountpoint="/"})) * 100
+```
+
+**Скорость I/O:**
+
+```promql
+# Скорость чтения (MB/s)
+rate(node_disk_read_bytes_total{device="sda"}[5m]) / 1024 / 1024
+
+# Скорость записи (MB/s)
+rate(node_disk_write_bytes_total{device="sda"}[5m]) / 1024 / 1024
+```
+
+**Сетевые метрики:**
+
+```
+node_network_receive_bytes_total{device="eth0"}       # Байт получено
+node_network_transmit_bytes_total{device="eth0"}      # Байт отправлено
+node_network_receive_packets_total{device="eth0"}     # Пакетов получено
+node_network_transmit_packets_total{device="eth0"}    # Пакетов отправлено
+node_network_receive_errs_total{device="eth0"}        # Ошибок при получении
+node_network_transmit_errs_total{device="eth0"}       # Ошибок при отправке
+node_network_receive_dropped_total{device="eth0"}     # Пакетов потеряно (приём)
+node_network_transmit_dropped_total{device="eth0"}    # Пакетов потеряно (отправка)
+```
+
+**Скорость трафика:**
+
+```promql
+# Скорость входящего трафика (Mbps)
+rate(node_network_receive_bytes_total{device="eth0"}[5m]) * 8 / 1024 / 1024
+
+# Скорость исходящего трафика (Mbps)
+rate(node_network_transmit_bytes_total{device="eth0"}[5m]) * 8 / 1024 / 1024
+```
+
+---
+
+### Требование 3: Метрики потребляемых ресурсов для каждого сервиса
+
+**Способ 1: Экспортеры для известных сервисов**
+
+Для каждого сервиса есть готовый экспортер:
+
+**PostgreSQL метрики (postgres_exporter):**
+```
+pg_stat_activity_count                    # Активные соединения
+pg_stat_activity_max_tx_duration          # Самая длинная транзакция
+pg_database_size_bytes                    # Размер БД
+pg_table_size_bytes                       # Размер таблицы
+pg_stat_database_tup_returned              # Строк возвращено
+pg_stat_database_tup_fetched               # Строк получено
+```
+
+**MySQL метрики (mysqld_exporter):**
+```
+mysql_global_variables_max_connections    # Макс соединений
+mysql_global_status_threads_connected     # Активные соединения
+mysql_global_status_questions             # Всего запросов
+mysql_slave_status_seconds_behind_master  # Отставание репликации
+```
+
+**Redis метрики (redis_exporter):**
+```
+redis_connected_clients                   # Активные клиенты
+redis_used_memory_bytes                   # Используемая память
+redis_info_stats_total_commands_processed # Всего команд
+redis_keyspace_keys_total                 # Ключей в БД
+```
+
+**Nginx метрики (nginx-prometheus-exporter или stub_status):**
+```
+nginx_up                                  # Nginx работает?
+nginx_requests_total                      # Всего запросов
+nginx_request_duration_seconds             # Время обработки
+nginx_connections_accepted_total          # Принято соединений
+nginx_connections_active                  # Активные соединения
+```
+
+**Способ 2: Custom метрики из приложения**
+
+Приложение использует Prometheus client library и экспортирует свои метрики.
+
+---
+
+### Требование 4: Метрики, специфичные для каждого сервиса
+
+**Решение:** Prometheus client library в приложениях
+
+Приложение экспортирует метрики на HTTP endpoint'е (обычно :8000/metrics).
+
+**Типы метрик:**
+
+**Counter (счётчик) — только увеличивается:**
+```
+payments_processed_total{status="success"}     # 50000
+payments_processed_total{status="failed"}      # 150
+payments_processed_total{status="cancelled"}   # 25
+```
+
+**Gauge (измеритель) — может увеличиваться и уменьшаться:**
+```
+active_payments                         # 42 (текущее количество)
+database_connections_active             # 95 из 100
+cache_size_bytes                        # 5368709120 (5GB)
+queue_size                              # 1024 (задания в очереди)
+```
+
+**Histogram (гистограмма) — распределение значений:**
+```
+payment_duration_seconds_bucket{le="0.1"}    # < 0.1s: 1500 платежей
+payment_duration_seconds_bucket{le="1.0"}    # < 1s: 4800 платежей
+payment_duration_seconds_bucket{le="5.0"}    # < 5s: 4950 платежей
+payment_duration_seconds_bucket{le="+Inf"}   # всего: 5000 платежей
+
+payment_duration_seconds_count               # 5000 (всего)
+payment_duration_seconds_sum                 # 12345 (сумма всех времён)
+```
+
+**Примеры для платёжного сервиса:**
+
+```
+# Счётчики
+payments_processed_total{status="success"}
+payments_processed_total{status="failed"}
+payment_retries_total
+payment_refunds_total
+
+# Измеритель
+active_payments                    # Текущие платежи
+pending_approval_count             # Ожидают подтверждения
+
+# Гистограмма
+payment_processing_duration_seconds            # Время обработки
+payment_amount_processed_bytes                 # Размер платежа
+
+# Сумма
+payment_total_amount{currency="USD"}          # Общая сумма платежей
+```
+
+**Примеры для API сервиса:**
+
+```
+# Счётчики
+http_requests_total{method="GET",status="200"}
+http_requests_total{method="POST",status="500"}
+http_request_errors_total
+
+# Гистограмма
+http_request_duration_seconds                 # Время обработки
+
+# Измеритель
+http_requests_in_flight                       # Текущие запросы
+```
+
+**Примеры для Worker сервиса:**
+
+```
+# Счётчики
+tasks_processed_total{status="success"}
+task_failures_total
+task_retries_total
+
+# Гистограмма
+task_processing_duration_seconds              # Время обработки
+
+# Измеритель
+queue_size                                    # Размер очереди
+active_workers                                # Работающих worker'ов
+```
+
+---
+
+### Требование 5: Пользовательский интерфейс с запросами и агрегацией
+
+**Решение:** Grafana Dashboards + PromQL
+
+**Базовые PromQL запросы:**
+
+```promql
+# Текущее использование памяти на конкретном хосте
+node_memory_MemUsed_bytes{instance="web-01:9100"}
+
+# Среднее использование CPU за последние 5 минут
+avg(rate(node_cpu_seconds_total{mode="user"}[5m]))
+```
+
+**Агрегирующие запросы:**
+
+```promql
+# Среднее использование памяти по всем web серверам
+avg(node_memory_MemUsed_bytes{instance=~"web-.*"})
+
+# Максимальное использование CPU по всем хостам
+max(rate(node_cpu_seconds_total{mode="user"}[5m])) by (instance)
+
+# Топ 5 хостов по использованию диска
+topk(5, node_filesystem_used_bytes{mountpoint="/"})
+
+# Сумма сетевого трафика всех хостов
+sum(rate(node_network_receive_bytes_total[5m]))
+```
+
+**Специфичные для приложения:**
+
+```promql
+# Скорость обработки платежей (платежей в секунду)
+rate(payments_processed_total[1m])
+
+# Процент ошибок
+(rate(payments_processed_total{status="failed"}[5m]) / 
+ rate(payments_processed_total[5m])) * 100
+
+# Среднее время обработки платежа
+rate(payment_processing_duration_seconds_sum[5m]) / 
+rate(payment_processing_duration_seconds_count[5m])
+
+# Время ответа 95-го перцентиля
+histogram_quantile(0.95, rate(payment_processing_duration_seconds_bucket[5m]))
+
+# Активные платежи
+active_payments
+```
+
+---
+
+### Требование 6: Пользовательский интерфейс с настраиваемыми панелями
+
+**Решение:** Grafana позволяет создавать кастомные дашборды
+
+**Типовые дашборды:**
+
+**1. Host Overview дашборд**
+- Название: "System Metrics - web-01"
+- Панели:
+  - CPU Usage (%) — График
+  - RAM Usage (%) — Gauge
+  - Disk Usage (%) — Bar chart
+  - Network Incoming (Mbps) — График
+  - Network Outgoing (Mbps) — График
+  - Load Average — Таблица (1m, 5m, 15m)
+  - Uptime (дни) — Stat
+
+**2. Fleet Overview дашборд**
+- Название: "All Servers Overview"
+- Панели:
+  - CPU Max (%) — Stat
+  - RAM Max (%) — Stat
+  - Disk Max (%) — Stat
+  - Network Traffic Total (Mbps) — График
+  - Таблица всех хостов с текущими метриками
+
+**3. Application Metrics дашборд**
+- Название: "Payment Service Metrics"
+- Панели:
+  - Requests per Second — График
+  - Error Rate (%) — График
+  - Response Time (ms) — График
+  - Active Payments — Gauge
+  - Queue Size — Gauge
+  - Top Errors — Таблица
+
+**4. Database Metrics дашборд**
+- Название: "PostgreSQL Metrics"
+- Панели:
+  - Connections (active/max) — Gauge
+  - Query Execution Time — График
+  - Slow Queries — Таблица
+  - Transaction Duration — График
+  - Transactions per Second — График
+  - Cache Hit Ratio (%) — Stat
+
+**5. System Health дашборд**
+- Название: "Overall System Health"
+- Панели:
+  - Services Status (зелёный/красный)
+  - Uptime % — Stat
+  - Alerts Firing (красный если есть)
+  - Average Resource Usage — Таблица
+
+---
+
+## Обоснование выбора Prometheus
+
+### Почему Prometheus лучше, чем New Relic
+
+**New Relic:**
+- Полный APM (application performance monitoring)
+- Встроённое распределённое трассирование
+- Стоимость: $5,000-50,000/месяц
+- Требует лицензирования
+- Облачное решение (данные у New Relic)
+- Немного дорого и сложно для начала
+
+**Prometheus:**
+- Специализирован на метриках
+- Бесплатен (open source)
+- Требует 2-4 CPU, 4-8 GB RAM (самопокупка)
+- Полный контроль над данными
+- Мощный встроённый язык запросов (PromQL)
+
+**Экономия: 10-50 раз дешевле**
+
+### Почему Prometheus лучше, чем Datadog
+
+**Datadog:**
+- All-in-one платформа (метрики + логи + APM)
+- Стоимость: $50-200/месяц на хост
+- Облачное решение (данные у Datadog)
+- Нет полного контроля
+
+**Prometheus:**
+- Бесплатен
+- Полный контроль
+- Можно комбинировать с Loki (логи) и Jaeger (трейсинг)
+
+### Почему Prometheus лучше, чем InfluxDB
+
+**InfluxDB:**
+- Тоже база данных временных рядов
+- Push-based модель (приложение отправляет метрики)
+- InfluxQL менее мощный чем PromQL
+- Требует настройки в каждом приложении
+
+**Prometheus:**
+- Pull-based модель (Prometheus сам тянет метрики)
+- PromQL мощнее (функции анализа, прогнозирования)
+- Встроённый AlertManager
+- Лучше интегрирован с экосистемой (Node Exporter, exporters)
+
+---
+
+## Требования к ресурсам
+
+### На каждом хосте
+
+| Компонент | CPU | RAM | Диск |
+|-----------|-----|-----|------|
+| Node Exporter | 0.05 | 50 MB | - |
+
+**На 100 хостов:** ~5 CPU, 5 GB RAM
+
+### На центральном сервере
+
+На 100 хостов с 500+ метриками каждый:
+
+| Компонент | CPU | RAM | Хранилище |
+|-----------|-----|-----|-----------|
+| Prometheus | 2-4 | 4-8 GB | 50 GB/месяц |
+| AlertManager | 0.5 | 500 MB | - |
+| Grafana | 1 | 1 GB | 10 GB |
+| **ИТОГО** | **3.5-5.5** | **5-9 GB** | **60 GB/месяц** |
+
+**Стоимость в облаке:** $200-400/месяц
+**Self-hosted:** 1 сервер (4 CPU, 16 GB RAM, 500 GB SSD)
+
+---
+
+
+## Заключение
+
+**Prometheus + Node Exporter + Grafana + AlertManager** — это оптимальное решение потому что:
+
+✅ **Полнота:** Соответствует всем 6 требованиям  
+✅ **Экономичность:** В 10-50 раз дешевле New Relic/Datadog  
+✅ **Надёжность:** Встроённый язык запросов, встроённые алерты  
+✅ **Масштабируемость:** От 1 до 1000+ серверов  
+✅ **Бесплатно:** Open source  
+✅ **Производительность:** Обрабатывает миллиарды метрик  
+
+Это позволяет командам быстро находить проблемы и оптимизировать систему.
+
